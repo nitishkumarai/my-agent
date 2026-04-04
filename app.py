@@ -70,8 +70,8 @@ def ask_agent(user_message: str, history: list) -> str:
         return final_response.choices[0].message.content
 
 # ── UI ────────────────────────────────────────────────────────
-st.title("🤖 My AI Agent")
-st.caption("Powered by Llama 3.3 70B + Web Search")
+st.title("🤖 Nitish's Chatbot")
+st.caption("Enabled by Gen AI + Web Search")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
