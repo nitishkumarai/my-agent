@@ -50,7 +50,9 @@ SYSTEM_PROMPT = (
     "- Respond with ONLY the JSON object, nothing else\n"
     "- Use calculator for ANY maths - never calculate in your head\n"
     "- Use search_web for anything current or after 2023\n"
-    "- Call final_answer when you are confident you have the answer\n"
+    "- For subjective questions like best, greatest, most popular - search once then call final_answer with your findings\n"
+    "- For opinion questions you do not need a definitive answer - summarise what you found and call final_answer\n"
+    "- Call final_answer when you have enough information, even if the answer is not 100% certain\n"
     "- Keep going until you call final_answer"
 )
 
@@ -68,7 +70,7 @@ def run_react_agent(user_message: str, history: list):
     messages.append({"role": "user", "content": user_message})
 
     steps = []
-    max_steps = 5
+    max_steps = 7  # increased from 5
 
     for step in range(max_steps):
         response = groq_client.chat.completions.create(
@@ -121,7 +123,6 @@ def extract_pdf_text(uploaded_file) -> str:
     return text
 
 def chunk_text(text: str, chunk_size: int = 200, overlap: int = 20) -> list:
-    """Split text into small overlapping chunks to keep tokens low."""
     words = text.split()
     chunks = []
     i = 0
@@ -139,7 +140,6 @@ def build_rag_index(chunks: list, model: SentenceTransformer):
     return index, embeddings
 
 def retrieve_relevant_chunks(question: str, chunks: list, index, model: SentenceTransformer, top_k: int = 3) -> str:
-    """Retrieve top 3 most relevant chunks only — keeps token usage low."""
     question_embedding = model.encode([question]).astype("float32")
     distances, indices = index.search(question_embedding, top_k)
     relevant = [chunks[i] for i in indices[0] if i < len(chunks)]
@@ -147,7 +147,6 @@ def retrieve_relevant_chunks(question: str, chunks: list, index, model: Sentence
 
 def ask_document(question: str, chunks: list, index, model: SentenceTransformer) -> str:
     context = retrieve_relevant_chunks(question, chunks, index, model)
-    # Trim context to max 3000 characters to stay well within token limits
     context = context[:3000]
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
