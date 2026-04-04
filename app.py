@@ -4,10 +4,19 @@ import json
 import streamlit as st
 from groq import Groq
 from tavily import TavilyClient
+import PyPDF2
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
 
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+# ── ReAct Tools ──────────────────────────────────────────────
 def search_web(query: str) -> str:
     results = tavily_client.search(query, max_results=3)
     output = ""
@@ -46,7 +55,6 @@ SYSTEM_PROMPT = (
 )
 
 def extract_json(text: str):
-    """Extract JSON object from text even if LLM adds extra text around it."""
     start = text.find("{")
     end = text.rfind("}") + 1
     if start != -1 and end != 0:
@@ -71,7 +79,6 @@ def run_react_agent(user_message: str, history: list):
 
         raw = response.choices[0].message.content.strip()
 
-        # Extract JSON even if LLM wraps it in text or code blocks
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
         raw = extract_json(raw)
@@ -79,7 +86,6 @@ def run_react_agent(user_message: str, history: list):
         try:
             action = json.loads(raw)
         except json.JSONDecodeError:
-            # Could not parse — return whatever the LLM said
             return raw, steps
 
         thought = action.get("thought", "")
@@ -88,11 +94,9 @@ def run_react_agent(user_message: str, history: list):
 
         steps.append(f"💭 **Thought:** {thought}")
 
-        # Agent is done
         if tool == "final_answer":
             return tool_input, steps
 
-        # Run a known tool
         if tool in TOOLS:
             steps.append(f"🔧 **Using {tool}:** `{tool_input}`")
             observation = TOOLS[tool](tool_input)
@@ -108,32 +112,128 @@ def run_react_agent(user_message: str, history: list):
 
     return "I was not able to find a confident answer.", steps
 
+# ── RAG Functions ────────────────────────────────────────────
+def extract_pdf_text(uploaded_file) -> str:
+    reader = PyPDF2.PdfReader(uploaded_file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n"
+    return text
+
+def chunk_text(text: str, chunk_size: int = 200, overlap: int = 20) -> list:
+    """Split text into small overlapping chunks to keep tokens low."""
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk)
+        i += chunk_size - overlap
+    return chunks
+
+def build_rag_index(chunks: list, model: SentenceTransformer):
+    embeddings = model.encode(chunks, show_progress_bar=False)
+    embeddings = np.array(embeddings).astype("float32")
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index, embeddings
+
+def retrieve_relevant_chunks(question: str, chunks: list, index, model: SentenceTransformer, top_k: int = 3) -> str:
+    """Retrieve top 3 most relevant chunks only — keeps token usage low."""
+    question_embedding = model.encode([question]).astype("float32")
+    distances, indices = index.search(question_embedding, top_k)
+    relevant = [chunks[i] for i in indices[0] if i < len(chunks)]
+    return "\n\n---\n\n".join(relevant)
+
+def ask_document(question: str, chunks: list, index, model: SentenceTransformer) -> str:
+    context = retrieve_relevant_chunks(question, chunks, index, model)
+    # Trim context to max 3000 characters to stay well within token limits
+    context = context[:3000]
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a document analysis assistant. "
+                    "Answer questions based ONLY on the context provided. "
+                    "If the answer is not in the context, say so clearly. "
+                    "Be concise and specific. Quote relevant parts when helpful."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Context from document:\n{context}\n\nQuestion: {question}"
+            }
+        ],
+        max_tokens=500
+    )
+    return response.choices[0].message.content
 
 # ── UI ───────────────────────────────────────────────────────
 st.title("🤖 Nitish's Chatbot")
 st.caption("Powered by Gen AI")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+tab1, tab2 = st.tabs(["💬 Chat", "📄 Document Q&A"])
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+# ── Tab 1: Chat ──────────────────────────────────────────────
+with tab1:
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-if user_input := st.chat_input("Ask me anything..."):
-    with st.chat_message("user"):
-        st.markdown(user_input)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            final_answer, reasoning_steps = run_react_agent(
-                user_input, st.session_state.messages
-            )
-        st.markdown(final_answer)
-        if reasoning_steps:
-            with st.expander("🔍 See reasoning"):
-                for s in reasoning_steps:
-                    st.markdown(s)
+    if user_input := st.chat_input("Ask me anything...", key="chat_input"):
+        with st.chat_message("user"):
+            st.markdown(user_input)
 
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    st.session_state.messages.append({"role": "assistant", "content": final_answer})
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                final_answer, reasoning_steps = run_react_agent(
+                    user_input, st.session_state.messages
+                )
+            st.markdown(final_answer)
+            if reasoning_steps:
+                with st.expander("🔍 See reasoning"):
+                    for s in reasoning_steps:
+                        st.markdown(s)
+
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.session_state.messages.append({"role": "assistant", "content": final_answer})
+
+# ── Tab 2: Document Q&A ──────────────────────────────────────
+with tab2:
+    st.subheader("📄 Document Q&A")
+    st.write("Upload a PDF and ask questions about any part of it.")
+
+    embedding_model = load_embedding_model()
+    uploaded_pdf = st.file_uploader("Upload a PDF", type=["pdf"])
+
+    if uploaded_pdf:
+        with st.spinner("Reading and indexing document..."):
+            doc_text = extract_pdf_text(uploaded_pdf)
+            chunks = chunk_text(doc_text)
+            index, _ = build_rag_index(chunks, embedding_model)
+
+        st.success(f"Document indexed — {len(chunks)} chunks ready.")
+
+        if "doc_history" not in st.session_state:
+            st.session_state.doc_history = []
+
+        for msg in st.session_state.doc_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if doc_question := st.chat_input("Ask a question about the document...", key="doc_input"):
+            with st.chat_message("user"):
+                st.markdown(doc_question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Searching document..."):
+                    answer = ask_document(doc_question, chunks, index, embedding_model)
+                st.markdown(answer)
+
+            st.session_state.doc_history.append({"role": "user", "content": doc_question})
+            st.session_state.doc_history.append({"role": "assistant", "content": answer})

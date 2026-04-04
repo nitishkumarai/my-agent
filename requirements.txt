@@ -1,3 +1,7 @@
 groq
 streamlit
 tavily-python
+PyPDF2
+numpy
+sentence-transformers
+faiss-cpu
