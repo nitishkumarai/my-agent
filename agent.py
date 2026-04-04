@@ -1,0 +1,26 @@
+import os
+from groq import Groq
+
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+def ask_agent(user_message: str) -> str:
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant. Answer clearly and concisely."},
+            {"role": "user", "content": user_message}
+        ]
+    )
+    return response.choices[0].message.content
+
+if __name__ == "__main__":
+    print("Agent ready. Type 'quit' to exit.\n")
+    while True:
+        user_input = input("You: ").strip()
+        if user_input.lower() in ("quit", "exit"):
+            break
+        if not user_input:
+            continue
+        print("\nAgent thinking...\n")
+        response = ask_agent(user_input)
+        print(f"Agent: {response}\n")
