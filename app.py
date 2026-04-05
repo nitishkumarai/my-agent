@@ -54,8 +54,10 @@ SYSTEM_PROMPT = (
     "- Use calculator for ANY maths - never calculate in your head\n"
     "- Use search_web for anything current or after 2023\n"
     "- For subjective questions like best, greatest, most popular - search once then call final_answer\n"
-    "- For opinion questions you do not need a definitive answer - summarise what you found and call final_answer\n"
-    "- Call final_answer when you have enough information, even if the answer is not 100% certain\n"
+    "- For opinion questions summarise what you found and call final_answer\n"
+    "- Call final_answer when you have enough information\n"
+    "- If search results are unclear or insufficient, call final_answer and say you could not find reliable information — do NOT guess or make up an answer\n"
+    "- Never fabricate facts, names, numbers, or dates — if unsure say so clearly\n"
     "- Keep going until you call final_answer"
 )
 
@@ -270,9 +272,16 @@ with tab1:
                 )
             st.markdown(final_answer)
             if reasoning_steps:
-                with st.expander("🔍 See reasoning"):
+                with st.expander("🔍 See reasoning and sources"):
                     for s in reasoning_steps:
                         st.markdown(s)
+                    # Show disclaimer if web search was used
+                    if any("search_web" in s for s in reasoning_steps):
+                        st.markdown(
+                            "---\n"
+                            "⚠️ *This answer is based on web search results. "
+                            "Please verify important information from the original sources.*"
+                        )
 
         st.session_state.messages.append({"role": "user", "content": user_input})
         st.session_state.messages.append({"role": "assistant", "content": final_answer})
