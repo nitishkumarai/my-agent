@@ -58,6 +58,8 @@ SYSTEM_PROMPT = (
     "- Call final_answer when you have enough information\n"
     "- If search results are unclear or insufficient, call final_answer and say you could not find reliable information — do NOT guess or make up an answer\n"
     "- Never fabricate facts, names, numbers, or dates — if unsure say so clearly\n"
+    "- Always give rich, contextual answers — never just a name or number alone. Include relevant background like dates, origins, roles, and interesting context around the answer\n"
+    "- Structure longer answers with clear paragraphs for readability\n"
     "- Keep going until you call final_answer"
 )
 
@@ -115,7 +117,8 @@ def run_react_agent(user_message: str, history: list):
                 response = groq_client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=messages,
-                    temperature=0.1
+                    temperature=0.3,
+                    max_tokens = 1000
                 )
             except Exception as e:
                 return classify_error(e), steps
