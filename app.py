@@ -16,13 +16,16 @@ tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 def load_embedding_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
-# ── ReAct Tools ──────────────────────────────────────────────
+# ── Tools ────────────────────────────────────────────────────
 def search_web(query: str) -> str:
-    results = tavily_client.search(query, max_results=3)
-    output = ""
-    for r in results["results"]:
-        output += f"- {r['title']}: {r['content'][:300]}\n\n"
-    return output
+    try:
+        results = tavily_client.search(query, max_results=3)
+        output = ""
+        for r in results["results"]:
+            output += f"- {r['title']}: {r['content'][:300]}\n\n"
+        return output
+    except Exception as e:
+        return f"Web search failed: {str(e)}. Try answering from your own knowledge."
 
 def calculator(expression: str) -> str:
     try:
@@ -50,7 +53,7 @@ SYSTEM_PROMPT = (
     "- Respond with ONLY the JSON object, nothing else\n"
     "- Use calculator for ANY maths - never calculate in your head\n"
     "- Use search_web for anything current or after 2023\n"
-    "- For subjective questions like best, greatest, most popular - search once then call final_answer with your findings\n"
+    "- For subjective questions like best, greatest, most popular - search once then call final_answer\n"
     "- For opinion questions you do not need a definitive answer - summarise what you found and call final_answer\n"
     "- Call final_answer when you have enough information, even if the answer is not 100% certain\n"
     "- Keep going until you call final_answer"
@@ -63,64 +66,110 @@ def extract_json(text: str):
         return text[start:end]
     return text
 
-def run_react_agent(user_message: str, history: list):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for msg in history[-6:]:
-        messages.append(msg)
-    messages.append({"role": "user", "content": user_message})
-
-    steps = []
-    max_steps = 7  # increased from 5
-
-    for step in range(max_steps):
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            temperature=0.1
+def classify_error(e: Exception) -> str:
+    """Convert technical exceptions into friendly user messages."""
+    error_str = str(e).lower()
+    if "429" in str(e) or "rate limit" in error_str or "tokens per day" in error_str:
+        return (
+            "⚠️ **Daily token limit reached.**\n\n"
+            "The free Groq tier allows 100,000 tokens per day. "
+            "You've used them all up for today.\n\n"
+            "**Options:**\n"
+            "- Wait a few hours for your quota to reset\n"
+            "- Check your usage at [console.groq.com](https://console.groq.com)\n"
+            "- Upgrade to Groq's paid tier for higher limits"
+        )
+    elif "401" in str(e) or "authentication" in error_str or "api key" in error_str:
+        return (
+            "🔑 **API key error.**\n\n"
+            "Your Groq API key seems to be invalid or missing.\n\n"
+            "**Fix:** Check that your `GROQ_API_KEY` environment variable is set correctly."
+        )
+    elif "connection" in error_str or "network" in error_str or "timeout" in error_str:
+        return (
+            "🌐 **Connection error.**\n\n"
+            "Could not reach the Groq API. This is usually temporary.\n\n"
+            "**Fix:** Check your internet connection and try again."
+        )
+    else:
+        return (
+            f"❌ **Something went wrong.**\n\n"
+            f"Error: {str(e)}\n\n"
+            "Please try again or refresh the page."
         )
 
-        raw = response.choices[0].message.content.strip()
+def run_react_agent(user_message: str, history: list):
+    try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for msg in history[-6:]:
+            messages.append(msg)
+        messages.append({"role": "user", "content": user_message})
 
-        if "```" in raw:
-            raw = raw.split("```")[1].replace("json", "").strip()
-        raw = extract_json(raw)
+        steps = []
+        max_steps = 7
 
-        try:
-            action = json.loads(raw)
-        except json.JSONDecodeError:
-            return raw, steps
+        for step in range(max_steps):
+            try:
+                response = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    temperature=0.1
+                )
+            except Exception as e:
+                return classify_error(e), steps
 
-        thought = action.get("thought", "")
-        tool = action.get("tool", "")
-        tool_input = action.get("input", "")
+            raw = response.choices[0].message.content.strip()
 
-        steps.append(f"💭 **Thought:** {thought}")
+            if "```" in raw:
+                raw = raw.split("```")[1].replace("json", "").strip()
+            raw = extract_json(raw)
 
-        if tool == "final_answer":
-            return tool_input, steps
+            try:
+                action = json.loads(raw)
+            except json.JSONDecodeError:
+                return raw, steps
 
-        if tool in TOOLS:
-            steps.append(f"🔧 **Using {tool}:** `{tool_input}`")
-            observation = TOOLS[tool](tool_input)
-            steps.append(f"👁️ **Result:** {observation[:500]}")
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({
-                "role": "user",
-                "content": f"Tool result: {observation}\n\nContinue. Respond with only JSON."
-            })
-        else:
-            steps.append(f"⚠️ Unknown tool: {tool}")
-            break
+            thought = action.get("thought", "")
+            tool = action.get("tool", "")
+            tool_input = action.get("input", "")
 
-    return "I was not able to find a confident answer.", steps
+            steps.append(f"💭 **Thought:** {thought}")
+
+            if tool == "final_answer":
+                return tool_input, steps
+
+            if tool in TOOLS:
+                steps.append(f"🔧 **Using {tool}:** `{tool_input}`")
+                observation = TOOLS[tool](tool_input)
+                steps.append(f"👁️ **Result:** {observation[:500]}")
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({
+                    "role": "user",
+                    "content": f"Tool result: {observation}\n\nContinue. Respond with only JSON."
+                })
+            else:
+                steps.append(f"⚠️ Unknown tool: {tool}")
+                break
+
+        return "I was not able to find a confident answer.", steps
+
+    except Exception as e:
+        return classify_error(e), []
 
 # ── RAG Functions ────────────────────────────────────────────
 def extract_pdf_text(uploaded_file) -> str:
-    reader = PyPDF2.PdfReader(uploaded_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+    try:
+        reader = PyPDF2.PdfReader(uploaded_file)
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+        if not text.strip():
+            return None
+        return text
+    except Exception as e:
+        return None
 
 def chunk_text(text: str, chunk_size: int = 200, overlap: int = 20) -> list:
     words = text.split()
@@ -146,32 +195,58 @@ def retrieve_relevant_chunks(question: str, chunks: list, index, model: Sentence
     return "\n\n---\n\n".join(relevant)
 
 def ask_document(question: str, chunks: list, index, model: SentenceTransformer) -> str:
-    context = retrieve_relevant_chunks(question, chunks, index, model)
-    context = context[:3000]
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a document analysis assistant. "
-                    "Answer questions based ONLY on the context provided. "
-                    "If the answer is not in the context, say so clearly. "
-                    "Be concise and specific. Quote relevant parts when helpful."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"Context from document:\n{context}\n\nQuestion: {question}"
-            }
-        ],
-        max_tokens=500
-    )
-    return response.choices[0].message.content
+    try:
+        context = retrieve_relevant_chunks(question, chunks, index, model)
+        context = context[:3000]
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a document analysis assistant. "
+                        "Answer questions based ONLY on the context provided. "
+                        "If the answer is not in the context, say so clearly. "
+                        "Be concise and specific. Quote relevant parts when helpful."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Context from document:\n{context}\n\nQuestion: {question}"
+                }
+            ],
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return classify_error(e)
 
 # ── UI ───────────────────────────────────────────────────────
 st.title("🤖 Nitish's Chatbot")
 st.caption("Powered by Gen AI")
+
+# ── Sidebar ──────────────────────────────────────────────────
+with st.sidebar:
+    st.header("ℹ️ How to use")
+    st.markdown("""
+    **💬 Chat tab**
+    Ask me anything — I can search the web and do calculations.
+
+    **📄 Document Q&A tab**
+    Upload a PDF and ask questions about its content.
+
+    ---
+    **⚠️ Limits**
+    This app uses Groq's free tier — 100,000 tokens per day.
+    Heavy usage may hit the daily limit.
+
+    ---
+    **🔄 Clear chat**
+    """)
+    if st.button("Clear chat history"):
+        st.session_state.messages = []
+        st.session_state.doc_history = []
+        st.rerun()
 
 tab1, tab2 = st.tabs(["💬 Chat", "📄 Document Q&A"])
 
@@ -213,26 +288,33 @@ with tab2:
     if uploaded_pdf:
         with st.spinner("Reading and indexing document..."):
             doc_text = extract_pdf_text(uploaded_pdf)
+
+        if doc_text is None:
+            st.error(
+                "❌ Could not read this PDF. "
+                "This usually happens with scanned or image-based PDFs. "
+                "Try a text-based PDF instead."
+            )
+        else:
             chunks = chunk_text(doc_text)
             index, _ = build_rag_index(chunks, embedding_model)
+            st.success(f"Document indexed — {len(chunks)} chunks ready.")
 
-        st.success(f"Document indexed — {len(chunks)} chunks ready.")
+            if "doc_history" not in st.session_state:
+                st.session_state.doc_history = []
 
-        if "doc_history" not in st.session_state:
-            st.session_state.doc_history = []
+            for msg in st.session_state.doc_history:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
 
-        for msg in st.session_state.doc_history:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+            if doc_question := st.chat_input("Ask a question about the document...", key="doc_input"):
+                with st.chat_message("user"):
+                    st.markdown(doc_question)
 
-        if doc_question := st.chat_input("Ask a question about the document...", key="doc_input"):
-            with st.chat_message("user"):
-                st.markdown(doc_question)
+                with st.chat_message("assistant"):
+                    with st.spinner("Searching document..."):
+                        answer = ask_document(doc_question, chunks, index, embedding_model)
+                    st.markdown(answer)
 
-            with st.chat_message("assistant"):
-                with st.spinner("Searching document..."):
-                    answer = ask_document(doc_question, chunks, index, embedding_model)
-                st.markdown(answer)
-
-            st.session_state.doc_history.append({"role": "user", "content": doc_question})
-            st.session_state.doc_history.append({"role": "assistant", "content": answer})
+                st.session_state.doc_history.append({"role": "user", "content": doc_question})
+                st.session_state.doc_history.append({"role": "assistant", "content": answer})
