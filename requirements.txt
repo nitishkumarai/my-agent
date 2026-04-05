@@ -5,3 +5,6 @@ PyPDF2
 numpy
 sentence-transformers
 faiss-cpu
+langgraph
+langchain
+langchain-groq

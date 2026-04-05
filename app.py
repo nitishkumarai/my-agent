@@ -7,6 +7,8 @@ from tavily import TavilyClient
 import PyPDF2
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from typing import TypedDict
+from langgraph.graph import StateGraph, END
 import faiss
 
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -16,7 +18,7 @@ tavily_client = TavilyClient(api_key=os.environ.get("TAVILY_API_KEY"))
 def load_embedding_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
-# ── Tools ────────────────────────────────────────────────────
+# ── Shared Tools ─────────────────────────────────────────────
 def search_web(query: str) -> str:
     try:
         results = tavily_client.search(query, max_results=3)
@@ -40,6 +42,7 @@ TOOLS = {
     "calculator": calculator,
 }
 
+# ── ReAct Agent ──────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant that reasons step by step.\n\n"
     "You have access to these tools:\n"
@@ -55,11 +58,10 @@ SYSTEM_PROMPT = (
     "- Use search_web for anything current or after 2023\n"
     "- For subjective questions like best, greatest, most popular - search once then call final_answer\n"
     "- For opinion questions summarise what you found and call final_answer\n"
-    "- Call final_answer when you have enough information\n"
-    "- If search results are unclear or insufficient, call final_answer and say you could not find reliable information — do NOT guess or make up an answer\n"
+    "- Call final_answer when you have enough information, even if the answer is not 100% certain\n"
+    "- If search results are unclear, call final_answer and say you could not find reliable information\n"
     "- Never fabricate facts, names, numbers, or dates — if unsure say so clearly\n"
-    "- Always give rich, contextual answers — never just a name or number alone. Include relevant background like dates, origins, roles, and interesting context around the answer\n"
-    "- Structure longer answers with clear paragraphs for readability\n"
+    "- Always give rich, contextual answers — never just a name or number alone\n"
     "- Keep going until you call final_answer"
 )
 
@@ -71,36 +73,21 @@ def extract_json(text: str):
     return text
 
 def classify_error(e: Exception) -> str:
-    """Convert technical exceptions into friendly user messages."""
     error_str = str(e).lower()
     if "429" in str(e) or "rate limit" in error_str or "tokens per day" in error_str:
         return (
             "⚠️ **Daily token limit reached.**\n\n"
-            "The free Groq tier allows 100,000 tokens per day. "
-            "You've used them all up for today.\n\n"
+            "The free Groq tier allows 100,000 tokens per day.\n\n"
             "**Options:**\n"
             "- Wait a few hours for your quota to reset\n"
-            "- Check your usage at [console.groq.com](https://console.groq.com)\n"
-            "- Upgrade to Groq's paid tier for higher limits"
+            "- Check usage at [console.groq.com](https://console.groq.com)"
         )
     elif "401" in str(e) or "authentication" in error_str or "api key" in error_str:
-        return (
-            "🔑 **API key error.**\n\n"
-            "Your Groq API key seems to be invalid or missing.\n\n"
-            "**Fix:** Check that your `GROQ_API_KEY` environment variable is set correctly."
-        )
+        return "🔑 **API key error.** Check that your `GROQ_API_KEY` is set correctly."
     elif "connection" in error_str or "network" in error_str or "timeout" in error_str:
-        return (
-            "🌐 **Connection error.**\n\n"
-            "Could not reach the Groq API. This is usually temporary.\n\n"
-            "**Fix:** Check your internet connection and try again."
-        )
+        return "🌐 **Connection error.** Check your internet connection and try again."
     else:
-        return (
-            f"❌ **Something went wrong.**\n\n"
-            f"Error: {str(e)}\n\n"
-            "Please try again or refresh the page."
-        )
+        return f"❌ **Something went wrong.**\n\nError: {str(e)}\n\nPlease try again."
 
 def run_react_agent(user_message: str, history: list):
     try:
@@ -118,13 +105,12 @@ def run_react_agent(user_message: str, history: list):
                     model="llama-3.3-70b-versatile",
                     messages=messages,
                     temperature=0.3,
-                    max_tokens = 1000
+                    max_tokens=1000
                 )
             except Exception as e:
                 return classify_error(e), steps
 
             raw = response.choices[0].message.content.strip()
-
             if "```" in raw:
                 raw = raw.split("```")[1].replace("json", "").strip()
             raw = extract_json(raw)
@@ -173,7 +159,7 @@ def extract_pdf_text(uploaded_file) -> str:
         if not text.strip():
             return None
         return text
-    except Exception as e:
+    except Exception:
         return None
 
 def chunk_text(text: str, chunk_size: int = 200, overlap: int = 20) -> list:
@@ -226,34 +212,128 @@ def ask_document(question: str, chunks: list, index, model: SentenceTransformer)
     except Exception as e:
         return classify_error(e)
 
+# ── LangGraph Pipeline ───────────────────────────────────────
+class PipelineState(TypedDict):
+    question: str
+    research: str
+    final_report: str
+
+def research_agent_node(state: PipelineState) -> PipelineState:
+    """Agent 1: Searches web and gathers current factual research."""
+    try:
+        search_results = search_web(state["question"])
+    except Exception:
+        search_results = "Web search unavailable."
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a research specialist. "
+                    "Extract and present key factual findings from web search results. "
+                    "Be specific — include names, dates, numbers. "
+                    "Do not add information not present in the search results."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {state['question']}\n\n"
+                    f"Web search results:\n{search_results}\n\n"
+                    "Extract the key factual findings."
+                )
+            }
+        ],
+        max_tokens=600,
+        temperature=0.1
+    )
+    return {**state, "research": response.choices[0].message.content}
+
+def analyst_agent_node(state: PipelineState) -> PipelineState:
+    """Agent 2: Takes raw research and writes a structured report."""
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert analyst. "
+                    "Turn raw research into a clear structured report with these sections:\n"
+                    "**1. Key Finding**\n"
+                    "**2. Background and Context**\n"
+                    "**3. Key Facts**\n"
+                    "**4. Summary**\n\n"
+                    "Use specific numbers and dates. Write professionally."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Question: {state['question']}\n\n"
+                    f"Raw research:\n{state['research']}\n\n"
+                    "Write a structured report."
+                )
+            }
+        ],
+        max_tokens=800,
+        temperature=0.3
+    )
+    return {**state, "final_report": response.choices[0].message.content}
+
+def build_pipeline():
+    graph = StateGraph(PipelineState)
+    graph.add_node("researcher", research_agent_node)
+    graph.add_node("analyst", analyst_agent_node)
+    graph.set_entry_point("researcher")
+    graph.add_edge("researcher", "analyst")
+    graph.add_edge("analyst", END)
+    return graph.compile()
+
+def run_pipeline(question: str) -> tuple:
+    """Run the LangGraph pipeline and return report + intermediate research."""
+    try:
+        app = build_pipeline()
+        initial_state = PipelineState(
+            question=question,
+            research="",
+            final_report=""
+        )
+        final_state = app.invoke(initial_state)
+        return final_state["final_report"], final_state["research"]
+    except Exception as e:
+        return classify_error(e), ""
+
 # ── UI ───────────────────────────────────────────────────────
 st.title("🤖 Nitish's Chatbot")
 st.caption("Powered by Gen AI")
 
-# ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("ℹ️ How to use")
     st.markdown("""
-    **💬 Chat tab**
-    Ask me anything — I can search the web and do calculations.
+    **💬 Chat**
+    Ask anything — web search + calculator included.
 
-    **📄 Document Q&A tab**
-    Upload a PDF and ask questions about its content.
+    **📄 Document Q&A**
+    Upload a PDF and ask questions about it.
+
+    **🔬 LangGraph Pipeline**
+    Two AI agents work together — a Researcher
+    and an Analyst — to produce a structured report.
 
     ---
-    **⚠️ Limits**
-    This app uses Groq's free tier — 100,000 tokens per day.
-    Heavy usage may hit the daily limit.
+    **⚠️ Token Limit**
+    Free tier: 100,000 tokens/day via Groq.
 
     ---
-    **🔄 Clear chat**
     """)
     if st.button("Clear chat history"):
         st.session_state.messages = []
         st.session_state.doc_history = []
         st.rerun()
 
-tab1, tab2 = st.tabs(["💬 Chat", "📄 Document Q&A"])
+tab1, tab2, tab3 = st.tabs(["💬 Chat", "📄 Document Q&A", "🔬 LangGraph Pipeline"])
 
 # ── Tab 1: Chat ──────────────────────────────────────────────
 with tab1:
@@ -278,12 +358,11 @@ with tab1:
                 with st.expander("🔍 See reasoning and sources"):
                     for s in reasoning_steps:
                         st.markdown(s)
-                    # Show disclaimer if web search was used
                     if any("search_web" in s for s in reasoning_steps):
                         st.markdown(
                             "---\n"
-                            "⚠️ *This answer is based on web search results. "
-                            "Please verify important information from the original sources.*"
+                            "⚠️ *Based on web search results. "
+                            "Verify important information from original sources.*"
                         )
 
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -304,8 +383,7 @@ with tab2:
         if doc_text is None:
             st.error(
                 "❌ Could not read this PDF. "
-                "This usually happens with scanned or image-based PDFs. "
-                "Try a text-based PDF instead."
+                "Try a text-based PDF rather than a scanned one."
             )
         else:
             chunks = chunk_text(doc_text)
@@ -330,3 +408,53 @@ with tab2:
 
                 st.session_state.doc_history.append({"role": "user", "content": doc_question})
                 st.session_state.doc_history.append({"role": "assistant", "content": answer})
+
+# ── Tab 3: LangGraph Pipeline ─────────────────────────────────
+with tab3:
+    st.subheader("🔬 LangGraph Research Pipeline")
+    st.write(
+        "Two AI agents work in sequence — a **Researcher** searches the web "
+        "and gathers current facts, then an **Analyst** structures them into "
+        "a professional report."
+    )
+
+    # Show the pipeline visually
+    st.markdown("""
+    Your Question
+      ↓
+[🔍 Research Agent]  — searches web, extracts key facts
+      ↓
+[📊 Analyst Agent]   — structures findings into a report
+      ↓
+Structured Report
+""")
+
+    st.divider()
+
+    if "pipeline_history" not in st.session_state:
+        st.session_state.pipeline_history = []
+
+    for msg in st.session_state.pipeline_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if pipeline_question := st.chat_input(
+        "Ask a research question...", key="pipeline_input"
+    ):
+        with st.chat_message("user"):
+            st.markdown(pipeline_question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Running LangGraph pipeline — Agent 1 researching, Agent 2 analysing..."):
+                report, raw_research = run_pipeline(pipeline_question)
+            st.markdown(report)
+            if raw_research:
+                with st.expander("🔍 See raw research from Agent 1"):
+                    st.markdown(raw_research)
+
+        st.session_state.pipeline_history.append(
+            {"role": "user", "content": pipeline_question}
+        )
+        st.session_state.pipeline_history.append(
+            {"role": "assistant", "content": report}
+        )
